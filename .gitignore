@@ -1,0 +1,10 @@
+# Lingkungan Virtual
+venv/
+__pycache__/
+
+# Kredensial dan API Keys
+.env
+credentials.json
+
+# Folder Data (Jangan upload data mentah ke repo publik)
+data/

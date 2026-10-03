@@ -32,7 +32,7 @@ southcity-automation-test/
 
 ```bash
 git clone https://github.com/Dzakiamriz22/south-city-test.git
-cd southcity-automation-test
+cd south-city-test
 python -m venv venv
 ```
 

@@ -31,7 +31,7 @@ southcity-automation-test/
 ### 1. Clone & buat virtual environment
 
 ```bash
-git clone https://github.com/<username>/southcity-automation-test.git
+git clone https://github.com/Dzakiamriz22/south-city-test.git
 cd southcity-automation-test
 python -m venv venv
 ```

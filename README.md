@@ -73,100 +73,49 @@ python main.py
 
 ## Logika Matching
 
-Setiap transaksi Kredit di GL itu adalah "bukti settlement" — artinya ada uang muka yang dilunasi. Tapi datanya gak langsung nyambung ke Working Paper, jadi perlu dicocokkan. Matching-nya pakai 2 tahap:
+Setiap transaksi Kredit di GL merupakan bukti settlement/realisasi atas uang muka yang pernah dikeluarkan. Sistem menggunakan arsitektur pencocokan bertingkat (3-Layer Matching Engine):
 
-### Tahap 1: Regex PO Number (prioritas utama)
+### Tahap 1: Regex PO / WO Number (Prioritas Utama — Deterministic)
 
-Banyak transaksi punya kode PO/WO di deskripsinya. Kode ini unik dan bisa dipakai sebagai "kunci" pencocokan.
+Transaksi pengadaan resmi memiliki nomor Purchase Order (PO) atau Work Order (WO) yang unik di deskripsinya.
 
 **Cara kerjanya:**
-1. Scan deskripsi GL dan Working Paper pakai regex pattern `[A-Z0-9]+/[A-Z0-9]+/\d+`
-2. Kalau ketemu PO number yang sama di kedua sisi → langsung match
-
-**Contoh konkret dari data:**
-
-```
-GL Kredit:
-  "TP01/PO/26010005 FURNITURE SHOW UNIT APARTEMEN THE PARC SM 1132..."
-                     ↓ regex extract
-              TP01/PO/26010005
-
-Working Paper:
-  "TP01/PO/26010005 FURNITURE SHOW UNIT APARTEMEN THE PARC SM 1132 - BAR STOOL"
-                     ↓ regex extract
-              TP01/PO/26010005
-
-Hasil: MATCH ✓ (PO sama persis)
-→ Isi Realization Date, No Voucher, Amount dari baris GL ini
-```
+1. Ekstraksi kode PO/WO menggunakan regex pattern:
+   ```python
+   r'\b[A-Z][A-Z0-9]*/(?:PO|WO)/\d+\b'
+   ```
+   Pattern ini mewajibkan segmen tengah berupa `PO` atau `WO` (contoh: `TP01/PO/26010005`, `HLJC/PO/26030003`), sehingga string lain seperti tanggal `11/3/2026` tidak salah terdeteksi sebagai PO.
+2. Jika GL dan Working Paper memiliki kode PO/WO yang sama persis $\rightarrow$ langsung di-match dengan akurasi 100%.
 
 Transaksi yang berhasil di-match via PO: `TP01/PO/26010005`, `FR01/PO/26010011`, `FR01/PO/26010007`, `HLJC/PO/26030003`, `HLJC/PO/26030002`, `TP01/PO/26010003`.
 
-### Tahap 2: Fuzzy String Matching (fallback)
+### Tahap 2: Fuzzy String Matching (Fallback — RapidFuzz 85%)
 
-Gak semua transaksi punya kode PO. Contohnya "PELUNASAN TAGIHAN DROPBOX" atau "TALENTA - BUSSINES FLAT FOR 4 MONTHS". Untuk kasus ini, pakai fuzzy matching — bandingin kemiripan teks deskripsinya.
+Untuk transaksi tanpa nomor PO atau baris Working Paper yang belum memiliki PO (contoh: Dropbox, Talenta, Sewa Space, Buka Puasa, Complimentary Show Unit, serta Styling Apartemen):
 
-**Library:** RapidFuzz (C-based, jauh lebih cepat dari FuzzyWuzzy)
+- **Library:** RapidFuzz (C++ engine, sangat cepat dan hemat memori).
+- **Text Normalization:** Menghilangkan kata administratif umum (`PELUNASAN`, `PENGEMBALIAN`, `DANA`, `UM`) dan referensi kode kurung agar fokus pada nama project.
+- **Scorer:** `token_set_ratio` dengan **Threshold 85%** — mengabaikan perbedaan urutan kata dan informasi pelengkap.
+- **Safety Guards:**
+  * Validasi periode bulan: mencegah transaksi pelunasan bulan April tertukar dengan uang muka bulan Maret.
+  * Validasi sisa saldo: memastikan nilai realisasi tidak melompat melebihi sisa saldo advance terkait.
 
-**Scorer:** `token_set_ratio` — ini yang paling cocok karena:
-- Gak peduli urutan kata (jadi "BUKA PUASA KARYAWAN" dan "KARYAWAN BUKA PUASA" tetap match)
-- Gak peduli ada kata tambahan (jadi kalau GL punya deskripsi lebih panjang, tetap bisa match)
-- Fokusnya di kesamaan "kumpulan kata", bukan urutan karakter
+Contoh kecocokan fuzzy:
+- GL `"PELUNASAN TAGIHAN DROPBOX PERIODE 11/3/2026 - 11/3/2027"` $\rightarrow$ WP `"ADVANCE PEMBAYARAN KARTU KREDIT BCA UNTUK TAGIHAN DROPBOX..."` (Skor: >88%)
+- GL `"FR01/PO/26010009 PAKET MEETING DI KIRANA RESTO & CAFE"` $\rightarrow$ WP `"PAKET MEETING DI KIRANA RESTO & CAFE"` (Skor: 100%)
+- GL `"TRANSFER KEKURANGAN DANA UM ACARA BUKA PUASA..."` $\rightarrow$ WP `"UM ACARA BUKA PUASA..."` (Skor: 100%)
 
-**Threshold:** 85% — cukup ketat supaya gak salah match, tapi cukup longgar buat nampung variasi penulisan.
+### Tahap 3: Keyword Anchor Matching (Penyelesaian Parsial Institusional)
 
-**Contoh konkret:**
-
-```
-GL Kredit:
-  "PELUNASAN TAGIHAN DROPBOX PERIODE 11/3/2026 - 11/3/2027"
-
-Working Paper:
-  "ADVANCE PEMBAYARAN KARTU KREDIT BCA UNTUK TAGIHAN DROPBOX PERIODE 11/3/2026 - 11/3/2027"
-
-Skor token_set_ratio: ~90% → di atas threshold 85%
-Hasil: MATCH ✓
-```
-
-```
-GL Kredit:
-  "PEMBAYARAN TALENTA BUSSINES FLAT FOR 4 MONTHS TERM-3"
-
-Working Paper:
-  "TALENTA - BUSSINES FLAT FOR 4 MONTHS (TERM-3) PERIODE 15 FEBRUARI 2026 - 14 JUNI 2026"
-
-Skor token_set_ratio: ~88% → MATCH ✓
-```
-
-### Alur Keseluruhan
-
-```
-Untuk setiap transaksi Kredit di GL:
-│
-├─ Apakah deskripsinya mengandung kode PO?
-│   ├─ YA → Cari WP yang punya PO sama
-│   │        ├─ Ketemu → MATCH
-│   │        └─ Gak ketemu → skip (PO-nya mungkin bukan dari WP ini)
-│   │
-│   └─ TIDAK → Fuzzy match ke semua deskripsi WP
-│              ├─ Skor >= 85% → MATCH
-│              └─ Skor < 85% → skip (beda transaksi)
-│
-└─ Kalau MATCH:
-    ├─ Pertama kali match ke WP row ini → simpan date, voucher, amount
-    └─ Sudah pernah match (multi-voucher) → tambahkan ke yang sudah ada
-```
+Untuk transaksi yang memiliki variasi penamaan instansi/kontrak antara GL dan Working Paper (contoh: GL mencatat `"PENERIMAAN PEMBAYARAN PBB MSCM AJB JV 2"` senilai Rp 315.869.963 untuk melunasi pos `"PEMBAYARAN PBB JV 2 SUMMARECON TAHUN 2026"`):
+- Sistem mencocokkan kata kunci unik (`PBB`, `JV`, `2`) yang hanya dimiliki oleh satu baris Working Paper.
+- Diverifikasi dengan guard nominal (`KREDIT-IDR <= Sisa Saldo`) sehingga tercatat sebagai **Lunas Sebagian** dan menyisakan saldo gantung sebesar Rp 107.104.216 sesuai konteks soal.
 
 ### Multi-Voucher Settlement
 
-Kadang 1 advance diselesaikan oleh lebih dari 1 voucher kredit. Contoh: advance furniture bisa dilunasi dalam 2 tahap pembayaran.
-
-Pakai pendekatan **Single Row**:
-- Nomor voucher digabung pakai koma → `ADV/BK/2604/0001, ADV/BK/2604/0002`
-- Tanggal digabung (yang unik saja, di-sort) → `2026-04-07, 2026-04-14`
-- Amount dijumlahkan → total dari semua voucher kredit
-
-Pendekatan ini dipilih karena lebih simpel dan gak perlu insert row yang bisa menggeser struktur Working Paper.
+Pada transaksi **Styling Apartemen The Parc**, pengajuan uang muka diselesaikan secara bertahap oleh banyak voucher GL. Sistem menerapkan **Pendekatan Single Row**:
+- **Unit SM 1132 (2 Bedroom):** 8 voucher kredit GL digabungkan dengan koma (`ADV/BK/2604/0012, ..., PMT2/BM/2604/0007`), nominal dijumlahkan menjadi **Rp 25.695.900** (Saldo = Rp 0, Lunas Penuh).
+- **Unit SM 1127 (Studio):** 3 voucher kredit GL digabungkan (`ADV/BK/2604/0019, 0020, PMT2/BM/2604/0008`), nominal dijumlahkan menjadi **Rp 1.583.700** (Saldo = Rp 0, Lunas Penuh).
 
 ## AI Integration
 
